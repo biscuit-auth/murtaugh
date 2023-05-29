@@ -2,12 +2,15 @@ use axum::{
     debug_handler,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
 };
+
+use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 use uuid::Uuid;
 
 async fn revoke_id(
@@ -19,6 +22,13 @@ async fn revoke_id(
         "insert into revoked_block (issuer_id, revocation_id) values($1, $2)",
         issuer_id,
         revocation_id
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query!(
+        "select pg_notify($1, $2)",
+        issuer_id.to_string(),
+        revocation_id,
     )
     .execute(pool)
     .await?;
@@ -66,6 +76,7 @@ async fn main() {
         .route("/", get(|| async { "Hello, World!" }))
         .route("/:issuer_id", get(list_revoked_ids_handler))
         .route("/:issuer_id/:revocation_id", post(revoke_id_handler))
+        .route("/:issuer_id/events", get(issuer_emitter))
         .with_state(state);
 
     // run it with hyper on localhost:3000
@@ -124,4 +135,25 @@ async fn revoke_id_handler(
         Ok(_) => Ok(()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+async fn issuer_emitter(
+    State(pool): State<Arc<Pool<Postgres>>>,
+    Path(issuer_id): Path<Uuid>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool.as_ref())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    listener
+        .listen(&issuer_id.to_string())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stream = listener.into_stream().map(|e| match e {
+        Ok(e) => Ok(Event::default().data(e.payload())),
+        Err(err) => {
+            println!("{}", &err);
+            Ok(Event::default().data("{}"))
+        }
+    });
+    Ok(Sse::new(stream))
 }
