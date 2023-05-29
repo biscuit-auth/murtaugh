@@ -1,11 +1,11 @@
 use axum::{
     debug_handler,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
-use serde::{Serialize};
+use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -32,6 +32,21 @@ async fn list_revoked_ids(
     let res = sqlx::query!(
         "select revocation_id from revoked_block where issuer_id = $1",
         issuer_id
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(res.iter().map(|x| x.revocation_id.clone()).collect())
+}
+
+async fn check_if_revoked(
+    pool: &Pool<Postgres>,
+    issuer_id: &Uuid,
+    ids: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let res = sqlx::query!(
+        "select revocation_id from revoked_block where issuer_id = $1 and revocation_id = any($2)",
+        issuer_id,
+        ids,
     )
     .fetch_all(pool)
     .await?;
@@ -65,16 +80,34 @@ pub struct RevokedId {
     revocation_id: String,
 }
 
+#[derive(Deserialize)]
+struct RevocationIds {
+    revocation_ids: Option<String>,
+}
+
 #[debug_handler]
 async fn list_revoked_ids_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
     Path(issuer_id): Path<Uuid>,
+    Query(revocation_ids): Query<RevocationIds>,
 ) -> Result<Json<Vec<RevokedId>>, StatusCode> {
-    let ids = list_revoked_ids(pool.as_ref(), &issuer_id)
+    let revoked;
+    if let Some(rs) = revocation_ids.revocation_ids {
+        revoked = check_if_revoked(
+            pool.as_ref(),
+            &issuer_id,
+            &rs.split(",").map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    } else {
+        revoked = list_revoked_ids(pool.as_ref(), &issuer_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     Ok(Json(
-        ids.iter()
+        revoked
+            .iter()
             .map(|i| RevokedId {
                 revocation_id: i.to_string(),
             })
