@@ -23,7 +23,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route("/:issuer_id", get(list_revoked_ids_handler))
-        .route("/:issuer_id/:revocation_id", post(revoke_id_handler))
+        .route("/:issuer_id", post(revoke_id_handler))
         .route("/:issuer_id/events", get(issuer_emitter))
         .with_state(state);
 

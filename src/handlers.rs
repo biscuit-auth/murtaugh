@@ -16,7 +16,7 @@ use sqlx::{postgres::PgNotification, Pool, Postgres};
 use crate::database::*;
 use crate::types::*;
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct RevokedId {
     pub revocation_id: RevocationId,
     pub expires_at: Option<DateTime<Utc>>,
@@ -62,9 +62,16 @@ pub async fn list_revoked_ids_handler(
 
 pub async fn revoke_id_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
-    Path((issuer_id, revocation_id)): Path<(IssuerId, RevocationId)>,
+    Path(issuer_id): Path<IssuerId>,
+    Json(revoked_id): Json<RevokedId>,
 ) -> Result<(), StatusCode> {
-    let r = revoke_id(pool.as_ref(), &issuer_id, &revocation_id, &None).await;
+    let r = revoke_id(
+        pool.as_ref(),
+        &issuer_id,
+        &revoked_id.revocation_id,
+        &revoked_id.expires_at,
+    )
+    .await;
     match r {
         Ok(_) => Ok(()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
