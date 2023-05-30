@@ -106,6 +106,8 @@ pub async fn issuer_emitter(
     let pg_stream = listen_issuer_events(pool.as_ref(), &issuer_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let stream = pg_stream.map(|e| translate_notification(e).or_else(|_| todo!()));
+    let stream = pg_stream.map(|e| {
+        translate_notification(e).or_else(|_| Ok(Event::default().data(r#"{"error": true}"#)))
+    });
     Ok(Sse::new(stream))
 }
