@@ -9,7 +9,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use futures_util::stream::{Stream, StreamExt};
+use futures_util::stream::{iter, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgNotification, Pool, Postgres};
 
@@ -109,5 +109,18 @@ pub async fn issuer_emitter(
     let stream = pg_stream.map(|e| {
         translate_notification(e).or_else(|_| Ok(Event::default().data(r#"{"error": true}"#)))
     });
-    Ok(Sse::new(stream))
+    let existing = list_revoked_ids(pool.as_ref(), &issuer_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .iter()
+        .map(|r| {
+            Event::default()
+                .json_data(RevokedId {
+                    revocation_id: r.revocation_id.clone(),
+                    expires_at: r.expires_at,
+                })
+                .or_else(|_| Ok(Event::default().data(r#"{"error": true}"#)))
+        })
+        .collect::<Vec<_>>();
+    Ok(Sse::new(iter(existing).chain(stream)))
 }
