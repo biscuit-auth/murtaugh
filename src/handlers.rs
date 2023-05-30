@@ -8,9 +8,10 @@ use axum::{
     response::{sse::Event, Sse},
     Json,
 };
+use chrono::{DateTime, Utc};
 use futures_util::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Postgres};
+use sqlx::{postgres::PgNotification, Pool, Postgres};
 
 use crate::database::*;
 use crate::types::*;
@@ -18,10 +19,11 @@ use crate::types::*;
 #[derive(Serialize)]
 pub struct RevokedId {
     pub revocation_id: RevocationId,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
-pub struct RevocationIds {
+pub struct CommaSeparatedRevocationIds {
     revocation_ids: Option<String>,
 }
 
@@ -29,7 +31,7 @@ pub struct RevocationIds {
 pub async fn list_revoked_ids_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
     Path(issuer_id): Path<IssuerId>,
-    Query(revocation_ids): Query<RevocationIds>,
+    Query(revocation_ids): Query<CommaSeparatedRevocationIds>,
 ) -> Result<Json<Vec<RevokedId>>, StatusCode> {
     let revoked;
     if let Some(rs) = revocation_ids.revocation_ids {
@@ -51,7 +53,8 @@ pub async fn list_revoked_ids_handler(
         revoked
             .iter()
             .map(|i| RevokedId {
-                revocation_id: RevocationId(i.0.to_string()),
+                revocation_id: i.revocation_id.clone(),
+                expires_at: i.expires_at,
             })
             .collect(),
     ))
@@ -61,11 +64,32 @@ pub async fn revoke_id_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
     Path((issuer_id, revocation_id)): Path<(IssuerId, RevocationId)>,
 ) -> Result<(), StatusCode> {
-    let r = revoke_id(pool.as_ref(), &issuer_id, &revocation_id).await;
+    let r = revoke_id(pool.as_ref(), &issuer_id, &revocation_id, &None).await;
     match r {
         Ok(_) => Ok(()),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+// translate a json-encoded PG notification into a SSE with a JSON body.
+// parsing and re-serialization is done on purpose here, we don't want to
+// have the database-internal representation leaked to API users
+fn translate_notification(
+    notification: Result<PgNotification, sqlx::Error>,
+) -> Result<Event, String> {
+    let payload = notification
+        .map_err(|e| e.to_string())?
+        .payload()
+        .to_string();
+    let parsed: (RevocationId, Option<DateTime<Utc>>) =
+        serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+
+    Event::default()
+        .json_data(RevokedId {
+            revocation_id: parsed.0,
+            expires_at: parsed.1,
+        })
+        .map_err(|e| e.to_string())
 }
 
 pub async fn issuer_emitter(
@@ -75,12 +99,6 @@ pub async fn issuer_emitter(
     let pg_stream = listen_issuer_events(pool.as_ref(), &issuer_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let stream = pg_stream.map(|e| match e {
-        Ok(e) => Ok(Event::default().data(e.payload())),
-        Err(err) => {
-            println!("{}", &err);
-            Ok(Event::default().data("{}"))
-        }
-    });
+    let stream = pg_stream.map(|e| translate_notification(e).or_else(|_| todo!()));
     Ok(Sse::new(stream))
 }
