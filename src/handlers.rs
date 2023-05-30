@@ -6,8 +6,9 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{sse::Event, Sse},
-    Json,
+    Extension, Json,
 };
+use biscuit_auth::{macros::authorizer, Biscuit};
 use chrono::{DateTime, Utc};
 use futures_util::stream::{iter, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -30,9 +31,11 @@ pub struct CommaSeparatedRevocationIds {
 #[debug_handler]
 pub async fn list_revoked_ids_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
+    Extension(token): Extension<Biscuit>,
     Path(issuer_id): Path<IssuerId>,
     Query(revocation_ids): Query<CommaSeparatedRevocationIds>,
 ) -> Result<Json<Vec<RevokedId>>, StatusCode> {
+    check_issuer(&token, &issuer_id)?;
     let revoked;
     if let Some(rs) = revocation_ids.revocation_ids {
         revoked = check_if_revoked(
@@ -62,9 +65,11 @@ pub async fn list_revoked_ids_handler(
 
 pub async fn revoke_id_handler(
     State(pool): State<Arc<Pool<Postgres>>>,
+    Extension(token): Extension<Biscuit>,
     Path(issuer_id): Path<IssuerId>,
     Json(revoked_id): Json<RevokedId>,
 ) -> Result<(), StatusCode> {
+    check_issuer(&token, &issuer_id)?;
     let r = revoke_id(
         pool.as_ref(),
         &issuer_id,
@@ -101,8 +106,10 @@ fn translate_notification(
 
 pub async fn issuer_emitter(
     State(pool): State<Arc<Pool<Postgres>>>,
+    Extension(token): Extension<Biscuit>,
     Path(issuer_id): Path<IssuerId>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    check_issuer(&token, &issuer_id)?;
     let pg_stream = listen_issuer_events(pool.as_ref(), &issuer_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -123,4 +130,16 @@ pub async fn issuer_emitter(
         })
         .collect::<Vec<_>>();
     Ok(Sse::new(iter(existing).chain(stream)))
+}
+
+fn check_issuer(token: &Biscuit, issuer_id: &IssuerId) -> Result<(), StatusCode> {
+    let mut authorizer = authorizer!(
+        r#"allow if issuer({issuer_id})"#,
+        issuer_id = issuer_id.0.to_string(),
+    );
+    authorizer
+        .add_token(token)
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    authorizer.authorize().map_err(|_| StatusCode::FORBIDDEN)?;
+    Ok(())
 }
